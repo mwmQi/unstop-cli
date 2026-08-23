@@ -1,0 +1,1876 @@
+#!/usr/bin/env python3
+"""
+unstop — Unstop.com CLI  (v2)
+Browse hackathons, internships, jobs, competitions & more from your terminal.
+
+Data source: unstop.com public API (reverse-engineered; no login needed).
+API notes: ~/unstop-sites/API_DOCUMENTATION.md · skill: unstop-cli
+
+Usage:
+  unstop hackathons                  live hackathons
+  unstop hackathons -k ai            server-side keyword filter
+  unstop hackathons -p 2             paginate
+  unstop closing -d 7                everything closing within 7 days
+  unstop search "ai hackathon"       global search across categories
+  unstop detail <id>                 details for one opportunity
+  unstop stats <id>                  top colleges registered in an event
+  unstop orgs                        browse organisations
+  unstop platform                    platform-wide stats
+  unstop watch add <id>              track an opportunity locally
+  unstop watch list                  tracked items + deadline countdown
+  unstop login                       OTP login (email or mobile)
+  unstop whoami / status             session info
+  unstop logout                      clear saved session
+  unstop open <id>                   print/open the URL
+  unstop types                       supported types
+  unstop --json <cmd>                raw JSON output
+"""
+
+import argparse
+import base64
+import datetime as dt
+import getpass
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://unstop.com"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+WATCH_FILE = os.path.expanduser("~/.config/unstop/watchlist.json")
+AUTH_FILE = os.path.expanduser("~/.config/unstop/auth.json")
+
+TYPES = {
+    "hackathon":    ["hackathons", "hackathon"],
+    "internship":   ["internships", "internship"],
+    "job":          ["jobs", "job"],
+    "competition":  ["competitions", "competition"],
+    "quiz":         ["quizzes", "quiz"],
+    "workshop":     ["workshops", "workshop"],
+    "scholarship":  ["scholarships", "scholarship"],
+}
+# canonical -> value expected in `opportunity=` query param (PLURAL only!)
+API_TYPE = {
+    "hackathon":   "hackathons",
+    "internship":  "internships",
+    "job":         "jobs",
+    "competition": "competitions",
+    "quiz":        "quizzes",
+    "workshop":    "workshops",
+    "scholarship": "scholarships",
+}
+LABEL = {"quiz": "quizzes"}
+ALIASES = {n: c for c, ns in TYPES.items() for n in ns}
+
+SORTS = ["latest", "popular", "trending"]
+STATUSES = ["live", "upcoming", "past"]
+
+
+# ---------------------------------------------------------------- http
+def _headers(auth=True):
+    h = {"User-Agent": UA, "Accept": "application/json",
+         "Referer": BASE + "/", "Origin": BASE}
+    if auth:
+        tok = load_auth().get("access_token")
+        if tok:
+            h["Authorization"] = "Bearer " + tok
+    return h
+
+
+def api_get(path, params=None, quiet=False, auth=True):
+    qs = ("?" + urllib.parse.urlencode(params)) if params else ""
+    req = urllib.request.Request(BASE + path + qs, headers=_headers(auth))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        if quiet:
+            return None
+        body = ""
+        if hasattr(e, "read"):
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+        die(f"request failed for {path}: {e} {body}".rstrip())
+
+
+def api_post(path, payload=None, auth=True, quiet=False):
+    """POST JSON. Returns (ok, parsed_body_or_error_text)."""
+    data = json.dumps(payload or {}).encode()
+    req = urllib.request.Request(BASE + path, data=data,
+                                 headers=_headers(auth), method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return True, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        if quiet:
+            return False, None
+        try:
+            return False, json.loads(body)
+        except Exception:
+            return False, body[:300]
+    except Exception as e:
+        if quiet:
+            return False, None
+        return False, str(e)
+
+
+def die(msg, code=1):
+    print(f"unstop: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- helpers
+def resolve_type(name):
+    t = ALIASES.get(name.lower())
+    if not t:
+        die(f"unknown type '{name}'. Valid: {', '.join(sorted(TYPES))}")
+    return t
+
+
+def plural(t):
+    return LABEL.get(t, t + "s")
+
+
+def public_url(opp):
+    pu = opp.get("public_url") or ""
+    return pu if pu.startswith("http") else (f"{BASE}/{pu}" if pu else "")
+
+
+def parse_dt(raw):
+    if not raw:
+        return None
+    s = str(raw).split(".")[0].replace("T", " ")
+    s = s.split("+")[0].replace("GMT+0530", "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(s[:19] if len(fmt) > 10 else s[:10], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def time_left(opp):
+    rl = opp.get("regnRequirements") or {}
+    end = parse_dt(rl.get("end_regn_dt") or opp.get("end_date"))
+    if not end:
+        return None
+    days = (end - dt.datetime.now()).days
+    secs = (end - dt.datetime.now()).total_seconds()
+    if secs <= 0:
+        return "closed"
+    if days == 0:
+        hours = int(secs // 3600)
+        return f"{max(hours,1)}h left"
+    if days == 1:
+        return "1 day left"
+    return f"{days} days left"
+
+
+def fmt_row(i, opp):
+    title = (opp.get("title") or "?").strip()
+    org = ((opp.get("organisation") or {}).get("name")) or ""
+    tl = time_left(opp) or ""
+    paid = "₹" if opp.get("paid") else "free"
+    loc = {"online": "Online"}.get((opp.get("region") or "").lower(),
+                                   (opp.get("region") or ""))
+    meta = " · ".join(x for x in [org, loc, paid] if x)
+    tail = c(tl, GREEN if ("left" in tl or "h left" in tl) else YELLOW) if tl else ""
+    out = f"{c(str(i).rjust(3), DIM)} {c(title, BOLD)}\n    {c(meta, CYAN)}"
+    if tail:
+        out += f" · {tail}"
+    return out + f"   #{opp.get('id')}"
+
+
+def extract_items(payload):
+    d = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(d, dict):
+        items = d.get("data")
+        if isinstance(items, list):
+            return items, d
+    if isinstance(d, list):
+        return d, {}
+    return [], {}
+
+
+def print_opps(opps):
+    for i, o in enumerate(opps, 1):
+        print(fmt_row(i, o))
+
+
+def color_enabled():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+RESET, BOLD, DIM, CYAN, GREEN, YELLOW = (
+    "\033[0m", "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m")
+
+
+def c(text, *codes):
+    if not color_enabled():
+        return str(text)
+    return "".join(codes) + str(text) + RESET
+
+
+def fetch_opp(ident):
+    """One opportunity by id: authorized endpoint first, then scan listings."""
+    payload = api_get(f"/api/opportunity/{ident}", quiet=True)
+    opp = (payload or {}).get("data") or {} if isinstance(payload, dict) else {}
+    if isinstance(opp, dict) and opp:
+        return opp
+    for t in sorted(API_TYPE):
+        page = 1
+        while page <= 8:
+            pl = api_get("/api/opportunity/search",
+                         {"opportunity": API_TYPE[t], "per_page": 20,
+                          "page": page, "sort": "latest", "status": "live"})
+            items, _ = extract_items(pl or {})
+            match = next((o for o in items if str(o.get("id")) == ident), None)
+            if match:
+                return match
+            if len(items) < 20:
+                break
+            page += 1
+    return None
+
+
+# ---------------------------------------------------------------- commands
+def cmd_list(args):
+    t = resolve_type(args.type)
+    params = {
+        "opportunity": API_TYPE[t],
+        "per_page": max(args.limit, 10),
+        "page": args.page,
+        "sort": args.sort,
+        "status": args.status,
+    }
+    if args.keyword:
+        params["keyword"] = args.keyword          # verified server-side filter
+    payload = api_get("/api/opportunity/search", params)
+    items, meta = extract_items(payload)
+    total = meta.get("total")
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        print(c("No results.", YELLOW))
+        return
+    head = f"── {plural(t)} · page {args.page}"
+    if total:
+        head += f" of ~{max(1, (int(total) + args.limit - 1)//args.limit)}"
+    if args.keyword:
+        head += f" · keyword “{args.keyword}”"
+    print(c(head + " ──", BOLD)); print()
+    print_opps(items); print()
+    hint = []
+    if args.page > 1:
+        hint.append(f"-p {args.page-1} prev")
+    if total and args.page * args.limit < int(total):
+        hint.append(f"-p {args.page+1} next")
+    if hint:
+        print(c("more: unstop " + t + " " + " · ".join(hint), DIM))
+
+
+def cmd_closing(args):
+    """Across all types: opportunities whose registration closes in N days."""
+    horizon = dt.datetime.now() + dt.timedelta(days=args.days)
+    found = []
+    for t in sorted(API_TYPE):
+        page = 1
+        while page <= args.pages:
+            pl = api_get("/api/opportunity/search",
+                         {"opportunity": API_TYPE[t], "per_page": 20,
+                          "page": page, "sort": "latest", "status": "live"})
+            items, _ = extract_items(pl or {})
+            if not items:
+                break
+            for o in items:
+                rl = o.get("regnRequirements") or {}
+                end = parse_dt(rl.get("end_regn_dt") or o.get("end_date"))
+                if end and dt.datetime.now() <= end <= horizon:
+                    found.append((end, o))
+            if len(items) < 20:
+                break
+            page += 1
+
+    if args.json:
+        print(json.dumps([o for _, o in sorted(found)], indent=2,
+                         ensure_ascii=False))
+        return
+    if not found:
+        print(c(f"No registrations closing within {args.days} day(s).", YELLOW))
+        return
+    found.sort(key=lambda x: x[0])
+    print(c(f"── closing within {args.days} day(s) · "
+            f"{len(found)} found ──", BOLD)); print()
+    print_opps([o for _, o in found])
+
+
+def cmd_search(args):
+    payload = api_get("/api/get-global-search-data",
+                      {"searchTerm": " ".join(args.query)})
+    data = payload.get("data") or {}
+    counts = data.get("countData") or []
+    items = data.get("data") or []
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if counts:
+        print(c("categories:", DIM))
+        for cc in counts:
+            print(f"  {(cc.get('categoryName') or '?'):24} "
+                  f"{cc.get('result', '?'):>6}  → {cc.get('public_url','')}")
+        print()
+    n = 0
+    for cat, lst in (items.items() if isinstance(items, dict)
+                     else [("results", items)]):
+        for it in lst[:args.limit]:
+            n += 1
+            print(fmt_row(n, it.get("content") or it))
+    if n == 0:
+        print(c("No results.", YELLOW))
+
+
+def cmd_detail(args):
+    ident = require_id(args.id)
+    opp = fetch_opp(ident)
+    if args.json:
+        print(json.dumps(opp, indent=2, ensure_ascii=False))
+        return
+    if not opp:
+        die(f"nothing found for id {ident}")
+
+    def g(k): return opp.get(k) or "-"
+    rl = opp.get("regnRequirements") or {}
+    rows = [
+        ("title", g("title")),
+        ("org", ((opp.get("organisation") or {}).get("name")) or "-"),
+        ("type", g("type")),
+        ("subtype", g("subtype")),
+        ("region", g("region")),
+        ("paid", "yes" if opp.get("paid") else "free"),
+        ("starts", g("start_date")),
+        ("ends", g("end_date")),
+        ("reg window", f"{rl.get('start_regn_dt','-')} → {rl.get('end_regn_dt','-')}"),
+        ("team size", f"{rl.get('min_team_size','-')}–{rl.get('max_team_size','-')}"),
+        ("time left", time_left(opp) or "-"),
+        ("prizes", opp.get("overall_prizes") or "-"),
+        ("id", g("id")),
+        ("url", public_url(opp)),
+    ]
+    w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"{c((k + ':').ljust(w + 1), CYAN)} {v}")
+    if color_enabled():
+        print(c(f"\ntip: unstop stats {ident} · unstop watch add {ident} "
+                f"· unstop open {ident}", DIM))
+
+
+def cmd_stats(args):
+    ident = require_id(args.id)
+    payload = api_get(f"/api/competition/{ident}/top-college-wise-registrations",
+                      {"limit": args.top})
+    rows = (payload or {}).get("data") or []
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if not rows:
+        print(c("No registration stats yet (or hidden for this event).", YELLOW))
+        return
+    print(c(f"── top colleges · event {ident} ──", BOLD)); print()
+    for i, r in enumerate(rows, 1):
+        name = r.get("organisation") or "?"
+        cnt = r.get("player_count", "?")
+        bar = "█" * min(int(cnt or 0), 30)
+        print(f"{c(str(i).rjust(3), DIM)} {cnt:>4}  {c(name, BOLD)}  {c(bar, CYAN)}")
+
+
+def cmd_orgs(args):
+    payload = api_get("/api/public/organisation-withtags",
+                      {"per_page": args.limit, "page": args.page,
+                       "is_home_page": "true"} if args.home else
+                      {"per_page": args.limit, "page": args.page})
+    items = ((payload or {}).get("data") or {}).get("data") or []
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        print(c("No results.", YELLOW))
+        return
+    print(c(f"── organisations · page {args.page} ──", BOLD)); print()
+    for i, o in enumerate(items, 1):
+        name = o.get("name") or "?"
+        url = o.get("public_url") or ""
+        tags = ", ".join(t.get("name", "") for t in (o.get("tags") or [])[:3])
+        line = f"{c(str(i).rjust(3), DIM)} {c(name, BOLD)}"
+        if tags:
+            line += c(f"  ({tags})", DIM)
+        if url:
+            line += f"\n     {BASE}/{url}"
+        print(line)
+
+
+def cmd_platform(_args):
+    payload = api_get("/api/public/home-page-stats")
+    d = (payload or {}).get("data") or {}
+    if _args and getattr(_args, "json", False):
+        print(json.dumps(d, indent=2))
+        return
+    rows = [("competitions", d.get("competitions")),
+            ("colleges", d.get("colleges")),
+            ("organisations", d.get("organisations")),
+            ("subscribers", d.get("subscribers"))]
+    print(c("── unstop.com platform stats ──", BOLD)); print()
+    for k, v in rows:
+        print(f"  {(k or '?').capitalize():16} {format_num(v)}")
+
+
+def format_num(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if v >= 10000000:
+        return f"{v/10000000:.2f}Cr"
+    if v >= 100000:
+        return f"{v/100000:.1f}L"
+    if v >= 1000:
+        return f"{v/1000:.1f}K"
+    return str(v)
+
+
+# ---------------------------------------------------------------- watchlist
+def load_watch():
+    try:
+        with open(WATCH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_watch(items):
+    os.makedirs(os.path.dirname(WATCH_FILE), exist_ok=True)
+    with open(WATCH_FILE, "w") as f:
+        json.dump(items, f, indent=1, ensure_ascii=False)
+
+
+def cmd_watch(args):
+    items = load_watch()
+    if args.action == "add":
+        opp = fetch_opp(require_id(args.id))
+        if not opp:
+            die(f"id {args.id} not found")
+        entry = {"id": str(opp.get("id")), "title": opp.get("title"),
+                 "url": public_url(opp),
+                 "added": dt.date.today().isoformat()}
+        if not any(e["id"] == entry["id"] for e in items):
+            items.append(entry)
+            save_watch(items)
+            print(c(f"✚ watching: {entry['title']}  #{entry['id']}", GREEN))
+        else:
+            print("already watching that one.")
+    elif args.action == "rm":
+        before = len(items)
+        items = [e for e in items if e["id"] != args.id]
+        save_watch(items)
+        print(c(f"removed {before - len(items)} item(s).", YELLOW))
+    else:  # list
+        if not items:
+            print("Watchlist empty. Add one: unstop watch add <id>")
+            return
+        print(c(f"── watchlist · {len(items)} ──", BOLD)); print()
+        for e in items:
+            fresh = fetch_opp(e["id"]) or {}
+            tl = time_left(fresh) if fresh else "?"
+            colr = GREEN if (tl and "left" in tl) else YELLOW
+            mark = c("⚠ CLOSING", YELLOW) if (
+                tl and (tl.startswith(("0h", "1 day", "2 day"))
+                        or (tl.endswith("left") and tl.split()[0].isdigit()
+                            and int(tl.split()[0]) <= 3))) else ""
+            print(f"  #{e['id']}  {c(e.get('title') or '?', BOLD)}"
+                  + (f"\n     {tl and c(tl, colr)}  {mark}" if tl else ""))
+        print(c("\ntip: run `unstop watch list` before deadlines, or wire it "
+                "into a cron job for alerts.", DIM))
+
+
+def cmd_open(args):
+    ident = require_id(args.id)
+    opp = fetch_opp(ident)
+    url = public_url(opp) if opp else None
+    if not url:
+        die(f"no url for {ident}")
+    browser = shutil.which("xdg-open") or shutil.which("open")
+    if browser and sys.stdout.isatty():
+        subprocess.run([browser, url])
+    print(url)
+
+
+def cmd_types(_args):
+    for k in sorted(TYPES):
+        print(f"{k:14} aliases: {', '.join(TYPES[k])}")
+
+
+# ---------------------------------------------------------------- blogs (v3)
+BLOG_BASE = BASE + "/blog/"
+
+
+def _strip_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    import html as _h
+    return re.sub(r"\s+", " ", _h.unescape(s)).strip()
+
+
+def _fetch_full_post(ident):
+    """Full post by slug via /api/public/post/<slug>, fallback ?slug=."""
+    payload = api_get("/api/public/post/" + ident, quiet=True) or {}
+    d = payload.get("data")
+    if isinstance(d, dict) and d.get("post"):
+        return d["post"]
+    payload = api_get("/api/public/posts", {"slug": ident}, quiet=True) or {}
+    items = payload.get("data")
+    if isinstance(items, list) and items:
+        return items[0]
+    return None
+
+
+def cmd_blogs(args):
+    """Public blog posts. Optional keyword filter (client-side)."""
+    kw = " ".join(args.query).lower() if args.query else None
+    page, seen = 1, []
+    want_cats = set(args.category) if args.category else None
+    while page <= args.pages:
+        payload = api_get("/api/public/posts",
+                          {"lessData": "true", "per_page": 20,
+                           "page": page}, quiet=True) or {}
+        d = payload.get("data")
+        items = d.get("data") if isinstance(d, dict) else d
+        if not items:
+            break
+        for p in items:
+            if want_cats is not None:
+                pcats = {cat.get("id") for cat in (p.get("all_categories") or [])}
+                if not (pcats & want_cats):
+                    continue
+            title = p.get("post_title") or "?"
+            if kw and kw not in title.lower() and kw not in _strip_html(
+                    p.get("post_excerpt") or "").lower():
+                continue
+            seen.append(p)
+        total_pages = d.get("last_page") if isinstance(d, dict) else None
+        if len(seen) >= max(args.limit, 40) or len(items) < 20 \
+                or (total_pages and page >= total_pages):
+            break
+        page += 1
+    shown = 0
+    for i, p in enumerate(seen[:args.limit], 1):
+        slug = p.get("post_name") or ""
+        date = (p.get("published_at") or "")[:10]
+        print(f"{c(str(i).rjust(3), DIM)} {c((p.get('post_title') or '?')[:78], BOLD)}")
+        bits = [x for x in (date, BLOG_BASE + slug) if x]
+        if bits:
+            print("     " + " · ".join([c(bits[0], CYAN)] + bits[1:]))
+        print()
+        shown += 1
+    if not shown:
+        print(c("No blog posts matched.", YELLOW))
+    else:
+        print(c("read one: unstop blog <slug-or-id>", DIM))
+
+
+def cmd_blog(args):
+    """Read one post: prints title, meta and full cleaned text."""
+    ident = str(args.id)
+    p = _fetch_full_post(ident)
+    if p is None:
+        die(f"post '{ident}' not found (try `unstop blogs`)")
+    body = _strip_html(p.get("post_content") or "")
+    wrapped = textwrap.fill(body, width=88)
+    print(c(p.get("post_title") or "?", BOLD))
+    print(c("-" * min(len(p.get("post_title") or ""), 60), DIM))
+    meta = []
+    if p.get("published_at"):
+        meta.append(p["published_at"][:10])
+    author = p.get("authorName") or (
+        "#" + str(p["post_author"]) if p.get("post_author") else None)
+    if author:
+        meta.append(str(author))
+    cats = ", ".join(x.get("name", "") for x in (p.get("categoriesName") or [])
+                     ) if isinstance(p.get("categoriesName"), list) else ""
+    if cats:
+        meta.append(cats)
+    meta.append(BLOG_BASE + (p.get("post_name") or ""))
+    print(" · ".join(m for m in meta if m)); print()
+    if not wrapped:
+        print(c("(no body returned for this post)", YELLOW))
+    else:
+        print(wrapped)
+    if args.json:
+        print(); print(json.dumps(p, indent=2, ensure_ascii=False)[:6000])
+
+
+def cmd_cats(_args):
+    payload = api_get("/api/public/get-categories?group=wp_category")
+    rows = payload.get("data") or []
+    for r in rows:
+        active = "" if r.get("is_active") else c(" inactive", DIM)
+        print(f"{str(r.get('id')):>4}  {c(r.get('name') or '?', BOLD)}"
+              f"  ({r.get('slug', '')}){active}")
+
+
+def cmd_tags(args):
+    payload = api_get("/api/public/get-tags",
+                      {"per_page": args.limit, "page": args.page,
+                       "paginate": "true"})
+    d = payload.get("data") or {}
+    items = d.get("data") if isinstance(d, dict) else d
+    for t_ in items or []:
+        print(f"{str(t_.get('id')):>5}  {c(t_.get('name') or '?', BOLD)}"
+              f"  #{t_.get('slug', '')}")
+
+
+def require_id(val):
+    val = str(val).lstrip("#")
+    if not val.isdigit():
+        die("pass a numeric id (get one from `unstop hackathons`)")
+    return val
+
+
+# ---------------------------------------------------------------- session
+def load_auth():
+    try:
+        with open(AUTH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_auth(sess):
+    os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+    fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(sess, f, indent=1, ensure_ascii=False)
+    try:
+        os.chmod(AUTH_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def clear_auth():
+    try:
+        os.remove(AUTH_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ------------------------------------------------------- encData decrypt
+_ENC_KEY = base64.b64decode(
+    "NEpLU3BZQlFvWkJxdStCOUpIVFJhSWkwMlpmRHhmREM=")
+
+
+def decrypt_encdata(enc_b64):
+    """Decrypt an `encData` blob -> python object (AES-256-CBC)."""
+    t = json.loads(base64.b64decode(enc_b64))
+    ct = base64.b64decode(t["value"])
+    iv = base64.b64decode(t["iv"])
+    try:
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
+        dec = Cipher(algorithms.AES(_ENC_KEY), modes.CBC(iv)).decryptor()
+        pt = dec.update(ct) + dec.finalize()
+    except ImportError:
+        # openssl fallback: hex stream, strip PKCS7
+        hexin = (ct + iv).hex()
+        raw = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-256-cbc", "-K", _ENC_KEY.hex(),
+             "-iv", iv.hex()], input=bytes.fromhex(hexin),
+            capture_output=True).stdout
+        pt = raw
+    pt = pt[:-pt[-1]] if pt and pt[-1] <= 16 else pt      # unpad PKCS7
+    s = pt.decode("utf-8", "replace")
+    m = re.search(r"\{.*\}", s, re.S)                     # strip s:N:"..." wrapper
+    return json.loads(m.group(0)) if m else None
+
+
+# ---------------------------------------------------------------- login
+def _norm_email(value):
+    """Email, or 10-digit mobile -> Unstop's mobile inbox pattern."""
+    value = value.strip()
+    if re.fullmatch(r"\d{10}", value):
+        return "91" + value + "@mobileairtel.com", True
+    if re.fullmatch(r"91\d{10}", value):
+        return value + "@mobileairtel.com", True
+    return value, False
+
+
+def _login_dispatch(args):
+    if args.expose:
+        cmd_login_expose(args)
+    else:
+        cmd_login(args)
+
+
+def _finish_socialish(resp, label):
+    """Shared: decrypt encData (or read token fields) + save session."""
+    enc = resp.get("encData") if isinstance(resp, dict) else None
+    sess = None
+    if enc:
+        try:
+            sess = decrypt_encdata(enc)
+        except Exception:
+            sess = None
+    if not sess and isinstance(resp, dict) and resp.get("access_token"):
+        sess = resp
+    if not sess or not sess.get("access_token"):
+        die(f"{label} login: no session in response "
+            f"({str(resp)[:150]})")
+    save_auth({
+        "access_token": sess.get("access_token"),
+        "refresh_token": sess.get("refresh_token"),
+        "expires_in": sess.get("expires_in"),
+        "token_type": sess.get("token_type", "Bearer"),
+        "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "user": {k: sess.get(k) for k in ("id", "name", "email", "mobile")},
+    })
+    u = sess.get("name") or sess.get("email") or "user"
+    print(c(f"✓ Logged in as {u}  ({label}, session saved)", GREEN))
+
+
+def cmd_login_password(args):
+    """Classic email+password login (grant_type=password)."""
+    if load_auth().get("access_token"):
+        print(c("Already logged in (`unstop logout` first to switch).", YELLOW))
+        return
+    email = args.email or input("Email: ").strip()
+    try:
+        password = args.password or getpass.getpass("Password: ")
+    except (EOFError, KeyboardInterrupt):
+        die("no password entered — rerun with -p or interactively")
+    if not email or not password:
+        die("email and password required")
+    payload = {"grant_type": "password", "username": email,
+               "email": email, "password": password,
+               "scope": "*", "network": "", "access_token": "",
+               "e": True}
+    ok, resp = api_post("/api/micro/oauth/v2/user/login", payload,
+                        auth=False)
+    if not ok:
+        msg = resp.get("message") if isinstance(resp, dict) else str(resp)[:200]
+        die(f"password login failed: {msg}")
+    _finish_socialish(resp, "password")
+
+
+def cmd_login_refresh(args):
+    """Exchange a refresh_token for a fresh access token.
+
+    NOTE (verified 2026-08-24): Unstop's server currently answers
+    `grant_type=refresh_token` with 401 "Unauthorized action." for tokens
+    issued via the email-OTP flow, even with XSRF cookie + header — the SPA
+    ships this call but it appears disabled server-side. Kept for
+    completeness; if Unstop re-enables it this just works."""
+    tok = args.refresh_token
+    if not tok:
+        saved = load_auth()
+        tok = saved.get("refresh_token")
+    if not tok:
+        try:
+            tok = getpass.getpass("Paste refresh_token: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            tok = ""
+    if not tok:
+        die("no refresh token")
+    ok, resp = api_post("/api/micro/oauth/v2/token",
+                        {"grant_type": "refresh_token", "scope": "",
+                         "network": "", "refresh_token": tok}, auth=False)
+    if not ok:
+        msg = resp.get("message") if isinstance(resp, dict) else str(resp)[:200]
+        die(f"refresh exchange failed: {msg} — Unstop currently rejects "
+            f"refresh-token grants (verified); use `unstop login` instead")
+    _finish_socialish(resp, "refresh-token")
+
+
+# ------------------------------------------------- social login bridge
+# Unstop's own SPA exchanges a provider token for a session via
+# POST /api/micro/oauth/v2/token  {grant_type: "social", access_token,
+# network: provider}. For LinkedIn it sends the OAuth *code* the same
+# way (network "linkedIN"). This bridge hosts a page that runs that
+# exchange in the OWNER's browser context — but to keep the session
+# server-side we instead collect the provider token/code and do the
+# exchange here, then save auth.json locally.
+_SOCIAL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>unstop-cli social login</title>
+<style>
+ body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;
+      display:flex;justify-content:center;padding-top:8vh}}
+ .card{{background:#1e293b;border-radius:14px;padding:32px;width:min(480px,92vw)}}
+ h1{{font-size:20px;margin:0 0 6px}} p{{color:#94a3b8;font-size:13.5px;margin:6px 0}}
+ input,button,select{{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;
+      font-size:15px;margin-bottom:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0}}
+ button{{background:#22c55e;color:#052e16;font-weight:700;border:none;cursor:pointer}}
+ #msg{{margin-top:10px;font-size:14px;min-height:20px}}
+ .ok{{color:#4ade80}} .err{{color:#f87171}}
+ details{{margin:8px 0;font-size:13px}} summary{{cursor:pointer;color:#7dd3fc}}
+ a{{color:#7dd3fc}}
+</style></head><body><div class="card">
+<h1>unstop-cli social login</h1>
+<p>Paste a provider <b>token</b> (or LinkedIn/Microsoft <b>?code=</b>) below.
+Leave the picker on <i>auto-detect</i> — the token shape identifies the
+provider.</p>
+
+<details><summary>▸ LinkedIn (one-click)</summary>
+ <a href="/auth/linkedin">Sign in with LinkedIn →</a><br>
+ You'll approve on LinkedIn and land back here automatically — nothing to
+ copy. (If LinkedIn rejects the redirect, use the manual paste below with
+ the <code>code=</code> from unstop.com/auth/login?code=...)</details>
+
+<details><summary>▸ Microsoft (one-click)</summary>
+ <a href="/auth/microsoft">Sign in with Microsoft →</a><br>
+ Same automatic flow.</details>
+
+<details><summary>▸ get a Google id_token (paste)</summary>
+ On <a href="https://unstop.com" target="_blank">unstop.com</a> click
+ "Continue with Google" and sign in. Then DevTools → Network tab → find the
+ request to <code>/api/micro/oauth/v2/token</code> → copy its
+ <code>access_token</code> value (a JWT starting <code>eyJ...</code>).</details>
+
+<details><summary>▸ get a Facebook access_token (paste)</summary>
+ Log in at facebook.com, then open
+ <a href="https://developers.facebook.com/tools/accesstoken/" target="_blank">
+ developers.facebook.com/tools/accesstoken</a> and copy the user token
+ (starts <code>EAA...</code>).</details>
+
+<details><summary>▸ LinkedIn manual (if one-click fails)</summary>
+ Open <a target="_blank"
+ href="https://www.linkedin.com/oauth/v2/authorization?response_type=code&scope=openid%20email%20profile&client_id=86960z6iocwaua&redirect_uri=https%3A%2F%2Funstop.com%2Fauth%2Flogin&state=unstop-cli">
+ this link</a>, approve it — you'll land on
+ <code>unstop.com/auth/login?code=XXXX</code>. Copy the <code>code=</code>
+ value quickly (the site may consume it).</details>
+
+<form id="f">
+ <select id="provider">
+   <option value="" selected>auto-detect</option>
+   <option value="google-one-tap">google (id_token)</option>
+   <option value="facebook">facebook (access_token)</option>
+   <option value="linkedIN">linkedin (oauth code)</option>
+   <option value="microsoft">microsoft (access_token)</option>
+ </select>
+ <input id="token" placeholder="paste token or code here">
+ <button type="submit">Login</button>
+</form>
+<div id="msg"></div></div>
+<script>
+$("f").onsubmit=async e=>{{e.preventDefault();
+ const r=await fetch('/social',{method:'POST',
+  headers:{{'Content-Type':'application/json'}},
+  body:JSON.stringify({{provider:$('provider').value,
+                       token:$('token').value}})}});
+ const j=await r.json();
+ const m=$('msg'); m.className=j.ok?'ok':'err'; m.textContent=j.message;
+}};
+const $=id=>document.getElementById(id);
+</script></body></html>"""
+
+
+def _social_origin_fix(page):
+    return page
+
+
+# Unstop SPA's provider ids (exact strings from its JS bundles):
+#   google  -> "google-one-tap" (sends the Google id_token JWT)
+#   facebook-> "facebook"       (FB user access_token, EAA...)
+#   linkedin-> "linkedIN"       (the OAuth *code* from /auth/login redirect)
+#   micro   -> "microsoft"      (MSAL access_token)
+_SOCIAL_HINTS = (
+    ("google-one-tap", re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.")),
+    ("facebook", re.compile(r"^EA[A-Za-z0-9]")),
+    ("microsoft", re.compile(r"^E[a-zA-Z0-9_-]{20,}$|^eyJ0eXAiOiJKV1Qi")),
+    ("linkedIN", None),          # fallback: opaque short code
+)
+
+# Provider authorize URLs. LinkedIn/Microsoft = full redirect flows; the
+# {RU} placeholder gets our bridge callback URL. Google uses One-Tap
+# id_tokens (no code flow we can hijack without their client secret) and
+# Facebook's FB.login token is produced in-page — both stay paste-based.
+# Configs extracted from Unstop's own SPA bundles (client ids are theirs).
+_LI_CLIENT = "86960z6iocwaua"
+_MS_AUTHORITY = ("https://login.microsoftonline.com/common/"
+                 "ce5c9480-7f5b-404c-9c29-d4b3f3d1aafe")
+_MS_CLIENT = "a4f40e0b-8377-4e83-aa2e-794a77f59902"
+_SOCIAL_OAUTH_URLS = {
+    "linkedin": ("https://www.linkedin.com/oauth/v2/authorization"
+                 "?response_type=code&scope=openid%20email%20profile"
+                 f"&client_id={_LI_CLIENT}&redirect_uri={{RU}}"
+                 "&state=unstop-cli"),
+    "microsoft": (f"{_MS_AUTHORITY}/oauth2/v2.0/authorize"
+                  "?response_type=code&response_mode=query"
+                  "&scope=openid%20profile%20email%20User.Read"
+                  f"&client_id={_MS_CLIENT}&redirect_uri={{RU}}"
+                  "&prompt=select_account"),
+}
+
+_CB_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>unstop-cli oauth</title>
+<style>body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;
+ display:flex;justify-content:center;padding-top:14vh}}
+ .c{{background:#1e293b;border-radius:12px;padding:28px;width:min(420px,90vw)}}
+ .ok{{color:#4ade80}} .err{{color:#f87171}}</style></head>
+<body><div class="c"><h2>unstop-cli social login</h2>
+<p class="{ok}">{msg}</p><p style="font-size:13px;color:#94a3b8">
+You can close this tab now.</p></div></body></html>"""
+
+
+def _detect_provider(token):
+    t = token.strip()
+    for name, pat in _SOCIAL_HINTS:
+        if pat is None:
+            continue
+        if pat.search(t):
+            return name
+    # google id_tokens are long JWTs; microsoft tokens are also long —
+    # prefer google-one-tap since Unstop's own flow uses it
+    if len(t) > 400 and "." in t:
+        return "google-one-tap"
+    if t.startswith("EAA"):
+        return "facebook"
+    return "linkedIN"
+
+
+def _social_exchange(provider, token, state=None):
+    """Exchange a provider token/code for an Unstop session (server-side)."""
+    ok, resp = api_post(
+        "/api/micro/oauth/v2/token",
+        {"grant_type": "social", "access_token": token,
+         "network": provider, "source_page": None}, auth=False)
+    enc = resp.get("encData") if isinstance(resp, dict) else None
+    sess = None
+    if enc:
+        try:
+            sess = decrypt_encdata(enc)
+        except Exception:
+            sess = None
+    if not sess and isinstance(resp, dict) and resp.get("access_token"):
+        sess = resp
+    if not sess or not sess.get("access_token"):
+        msg = resp.get("message") if isinstance(resp, dict) \
+            else str(resp)[:150]
+        return False, f"exchange failed: {msg}"
+    save_auth({
+        "access_token": sess.get("access_token"),
+        "refresh_token": sess.get("refresh_token"),
+        "expires_in": sess.get("expires_in"),
+        "token_type": sess.get("token_type", "Bearer"),
+        "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "user": {k: sess.get(k) for k in ("id", "name", "email", "mobile")},
+    })
+    who = sess.get("name") or sess.get("email") or "user"
+    print(f"\n✓ social login ({provider}) as {who} — session saved",
+          flush=True)
+    if state is not None:
+        state["done"] = True
+    return True, f"Logged in as {who}. You can close this tab."
+
+
+def cmd_login_social(args):
+    """OAuth proxy bridge: serves a page with one-click provider sign-in
+    links + paste box. LinkedIn/Microsoft use real redirect flows; Google/
+    Facebook use token paste (One-Tap / FB.login artifacts). The CLI
+    exchanges everything server-side via grant_type=social."""
+    state = {"done": False}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            host = self.headers.get("Host") or f"<ip>:{args.port}"
+            origin = f"http://{host}"
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/auth/"):
+                prov = path.split("/auth/", 1)[1].split("?")[0]
+                target = _SOCIAL_OAUTH_URLS.get(prov)
+                if not target:
+                    return self._send(404, "unknown provider")
+                # linkedin/microsoft: real redirect flow; redirect_uri points
+                # BACK to our bridge /cb/<prov> so the code lands here
+                if prov == "linkedin":
+                    ru = urllib.parse.quote(f"{origin}/cb/linkedin")
+                    self.send_response(302)
+                    self.send_header("Location", target.replace("{RU}", ru))
+                    self.end_headers()
+                    return
+                if prov == "microsoft":
+                    ru = urllib.parse.quote(f"{origin}/cb/microsoft")
+                    self.send_response(302)
+                    self.send_header("Location", target.replace("{RU}", ru))
+                    self.end_headers()
+                    return
+                # google/facebook: token produced in-browser -> just open page
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            if path.startswith("/cb/"):
+                prov = path.split("/cb/", 1)[1].split("?")[0]
+                qs = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                code = (qs.get("code") or [""])[0]
+                if not code:
+                    err = (qs.get("error_description") or
+                           qs.get("error") or ["no code"])[0]
+                    return self._send(200, _CB_PAGE.replace(
+                        "{msg}", f"✗ provider returned: {err}").replace(
+                        "{ok}", "err"))
+                ok, msg = _social_exchange(prov, code, state)
+                page = _CB_PAGE.replace("{msg}", msg).replace(
+                    "{ok}", "ok" if ok else "err")
+                self._send(200, page)
+                return
+            page = _SOCIAL_PAGE.replace("{origin}", origin)
+            self._send(200, page)
+
+        def do_POST(self):
+            ln = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(ln) or b"{}")
+            except Exception:
+                payload = {}
+            provider = str(payload.get("provider") or "").strip()
+            token = str(payload.get("token") or "").strip()
+            if not token:
+                return self._send_json({"ok": False,
+                                        "message": "token required"})
+            if not provider or provider == "auto":
+                provider = _detect_provider(token)
+            ok, msg = _social_exchange(provider, token, state)
+            return self._send_json({"ok": ok, "message": msg})
+
+        def _send_json(self, obj):
+            self._send(200, json.dumps(obj), "application/json")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    ip = args.public_ip or _public_ip()
+    url = f"http://{ip}:{args.port}/"
+    print(c("── unstop social login bridge ──", BOLD))
+    print(c("open in any browser:  ", DIM) + c(url, BOLD, CYAN))
+    print(c("providers: google / facebook / linkedin / microsoft "
+            "(auto-detect on)", DIM))
+    print(c("paste the provider token (or LinkedIn ?code=) in that page",
+            DIM))
+    print(c("ctrl-c to stop once logged in", DIM))
+    try:
+        srv.serve_forever()             # exactly one loop
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    sess = load_auth()
+    if sess.get("access_token"):
+        u = sess.get("user") or {}
+        print(c(f"✓ Logged in as {u.get('name') or u.get('email')}", GREEN))
+
+
+def cmd_login(args):
+    if load_auth().get("access_token"):
+        print(c("Already logged in (`unstop logout` first to switch).", YELLOW))
+        return
+    email, is_mobile = _norm_email(args.email or
+                                   input("Email or 10-digit mobile: ").strip())
+    ok, resp = api_post("/api/micro/oauth/v2/login/otp/send",
+                        {"email": email, "e": True}, auth=False)
+    msg = ((resp.get("data") or {}).get("message")
+           if isinstance(resp, dict) else str(resp))
+    if not ok or not (isinstance(resp, dict)
+                      and (resp.get("data") or {}).get("status", ok)):
+        die(f"could not send OTP: {msg}")
+    print(c("✚ OTP sent to " + (args.email or email), GREEN))
+
+    try:
+        otp = args.otp or getpass.getpass("Enter OTP: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        die("no OTP entered — rerun `unstop login <email>`")
+    body = {"otp": otp.strip(), "email": email, "e": True,
+            "channels": ["sms" if is_mobile else "email"],
+            "verify_via": ["mobile" if is_mobile else "email"],
+            "with_access_token": True}
+    if is_mobile:
+        body = {"otp": otp.strip(), "email": email,
+                "grant_type": "otp", "verify_via": ["mobile"]}
+    ok, resp = api_post("/api/micro/oauth/v2/login/otp/verify",
+                        body, auth=False)
+    if not ok:
+        die(f"OTP verify failed: {resp if isinstance(resp, str) else msg}")
+    enc = resp.get("encData") if isinstance(resp, dict) else None
+    if not enc:
+        die(f"no encData in response: {str(resp)[:200]}")
+    sess = decrypt_encdata(enc)
+    if not sess or not sess.get("access_token"):
+        die("could not decrypt session (no access_token)")
+    save_auth({
+        "access_token": sess.get("access_token"),
+        "refresh_token": sess.get("refresh_token"),
+        "expires_in": sess.get("expires_in"),
+        "token_type": sess.get("token_type", "Bearer"),
+        "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "user": {k: sess.get(k) for k in
+                 ("id", "name", "email", "mobile")},
+    })
+    u = sess.get("name") or sess.get("email") or "user"
+    print(c(f"✓ Logged in as {u}  (session saved, chmod 600)", GREEN))
+
+
+def cmd_login_token(args):
+    try:
+        tok = args.token or getpass.getpass("Paste access token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        die("no token entered — rerun `unstop login-token`")
+    if not tok:
+        die("empty token")
+    save = load_auth()
+    save.update({"access_token": tok, "token_type": "Bearer",
+                 "saved_at": dt.datetime.now().isoformat(timespec="seconds")})
+    save_auth(save)
+    # probe it against the profile endpoint (token now loaded from disk)
+    payload = api_get("/api/user/profile", {"e": "true"}, quiet=True)
+    d = (payload or {}).get("data") if isinstance(payload, dict) else None
+    prof = None
+    if isinstance(d, dict) and d.get("encData"):
+        try:
+            prof = decrypt_encdata(d["encData"])
+        except Exception:
+            prof = None
+    user = {}
+    if isinstance(prof, dict):
+        user = {k: prof.get(k) for k in ("id", "name", "email", "mobile")
+                if prof.get(k)}
+        save["user"] = user
+        save_auth(save)
+    if user:
+        print(c(f"✓ Token saved · logged in as "
+                f"{user.get('name') or user.get('email')}", GREEN))
+    else:
+        print(c("Token saved (could not verify against /profile — "
+                "check `unstop whoami`).", YELLOW))
+
+
+def _profile_decrypted():
+    """GET /api/user/profile and auto-decrypt its `encData` payload."""
+    payload = api_get("/api/user/profile", {"e": "true"}, quiet=True)
+    d = (payload or {}).get("data") if isinstance(payload, dict) else None
+    if not isinstance(d, dict) or not d:
+        return None
+    if d.get("encData"):
+        try:
+            return decrypt_encdata(d["encData"])
+        except Exception:
+            return None
+    return d
+
+
+def cmd_whoami(_args):
+    sess = load_auth()
+    if not sess.get("access_token"):
+        die("not logged in — run `unstop login`")
+    p = _profile_decrypted()
+    if _args.json:
+        print(json.dumps(p if p else sess.get("user") or sess, indent=2,
+                         ensure_ascii=False))
+        return
+    if not isinstance(p, dict) or not p:
+        print(c("Session looks expired/invalid. Try `unstop login` again.",
+                YELLOW))
+        return
+    rows = [(k, v) for k, v in sorted(p.items())
+            if v not in (None, "", [], {}) and k != "encData"]
+    if not rows:
+        print(c("(empty profile returned)", YELLOW))
+        return
+    w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"{c((k + ':').ljust(w + 1), CYAN)} {v}")
+
+
+def cmd_logout(_args):
+    if not load_auth().get("access_token"):
+        print("Not logged in.")
+        return
+    api_post("/api/logout", {}, auth=True)          # best-effort server side
+    clear_auth()
+    print(c("✓ Logged out (local session removed).", GREEN))
+
+
+def cmd_status(_args):
+    sess = load_auth()
+    if not sess.get("access_token"):
+        print(c("Not logged in.", YELLOW))
+        print(c("get started: unstop login", DIM))
+        return
+    saved = sess.get("saved_at", "?")
+    age = ""
+    try:
+        age_dt = dt.datetime.now() - dt.datetime.fromisoformat(saved)
+        age = f" · saved {age_dt.days}d ago" if age_dt.days else \
+              f" · saved {age_dt.seconds//3600}h ago"
+    except Exception:
+        pass
+    u = sess.get("user") or {}
+    who = u.get("name") or u.get("email") or "unknown user"
+    live = api_get("/api/user/profile", {"e": "true"}, quiet=True)
+    state = c("valid", GREEN) if isinstance(live, dict) and live.get("data") \
+        else c("expired/unknown", YELLOW)
+    print(f"logged in as {c(who, BOLD)} · token {state}{age}")
+
+
+# ------------------------------------------------------- login --expose
+# Agent-friendly login: the CLI starts a tiny local web server. An agent
+# (running headless on a VPS) prints the URL; the owner opens it in any
+# browser, enters email/mobile + OTP there, and the server completes the
+# login server-side and saves the session to ~/.config/unstop/auth.json.
+_EXPOSE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unstop CLI — Login</title>
+<style>
+ body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;
+      display:flex;justify-content:center;padding-top:8vh}}
+ .card{{background:#1e293b;border-radius:14px;padding:32px;width:min(420px,92vw)}}
+ h1{{font-size:20px;margin:0 0 6px}} p{{color:#94a3b8;font-size:14px;margin:0 0 18px}}
+ input,button{{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;
+      font-size:15px;margin-bottom:10px;border:1px solid #334155}}
+ input{{background:#0f172a;color:#e2e8f0}}
+ button{{background:#22c55e;color:#052e16;font-weight:700;border:none;cursor:pointer}}
+ #msg{{margin-top:10px;font-size:14px;min-height:20px}}
+ .ok{{color:#4ade80}} .err{{color:#f87171}}
+</style></head><body><div class="card">
+<h1>unstop-cli login</h1><p>Enter your Unstop email or 10-digit mobile.
+An OTP will be sent; enter it below.</p>
+<form id="f">
+ <input id="id" name="id" placeholder="email or 9876543210" autocomplete="username">
+ <button type="submit">Send OTP</button>
+</form>
+<form id="f2" style="display:none">
+ <input id="otp" name="otp" placeholder="6-digit OTP" inputmode="numeric"
+        autocomplete="one-time-code">
+ <button type="submit">Verify &amp; Login</button>
+</form>
+<div id="msg"></div></div>
+<script>
+const $=id=>document.getElementById(id);
+$("f").onsubmit=async e=>{{e.preventDefault();
+ const r=await fetch('/start',{method:'POST',
+   headers:{{'Content-Type':'application/json'}},
+   body:JSON.stringify({{id:$('id').value}})}});
+ const j=await r.json();
+ $("msg").className=j.ok?'ok':'err';
+ $("msg").textContent=j.message;
+ if(j.ok){{$("f").style.display='none';$("f2").style.display='block';}}}};
+$("f2").onsubmit=async e=>{{e.preventDefault();
+ const r=await fetch('/verify',{method:'POST',
+   headers:{{'Content-Type':'application/json'}},
+   body:JSON.stringify({{otp:$('otp').value}})}});
+ const j=await r.json();
+ $("msg").className=j.ok?'ok':'err';
+ $("msg").textContent=j.message;
+ if(j.ok){{$("f2").style.display='none';}}}};
+</script></body></html>"""
+
+
+def _public_ip():
+    try:
+        with urllib.request.urlopen(
+                "https://api.ipify.org", timeout=5) as r:
+            return r.read().decode().strip()
+    except Exception:
+        try:
+            with urllib.request.urlopen(
+                    "http://checkip.amazonaws.com", timeout=5) as r:
+                return r.read().decode().strip()
+        except Exception:
+            socket_ip = urllib.request.urlopen  # noqa: F841
+            return "<VPS-IP>"
+
+
+def cmd_login_expose(args):
+    """Headless login bridge for agents: serve a mini form, save session."""
+    state = {"email": None, "is_mobile": False}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._send(200, _EXPOSE_PAGE)
+
+        def do_POST(self):
+            ln = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(ln) or b"{}")
+            except Exception:
+                payload = {}
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/start":
+                ident = str(payload.get("id") or "").strip()
+                if not ident:
+                    return self._send_json({"ok": False,
+                                            "message": "empty id"})
+                email, is_mobile = _norm_email(ident)
+                ok, resp = api_post(
+                    "/api/micro/oauth/v2/login/otp/send",
+                    {"email": email, "e": True}, auth=False)
+                msg = ((resp.get("data") or {}).get("message")
+                       if isinstance(resp, dict) else str(resp)[:120])
+                if ok and isinstance(resp, dict) and \
+                        (resp.get("data") or {}).get("status"):
+                    state["email"], state["is_mobile"] = email, is_mobile
+                    disp = ident if "@" in ident else "+91 " + ident[-10:]
+                    return self._send_json(
+                        {"ok": True, "message": f"OTP sent to {disp}"})
+                return self._send_json(
+                    {"ok": False, "message": f"send failed: {msg}"})
+            if path == "/verify":
+                if not state.get("email"):
+                    return self._send_json(
+                        {"ok": False, "message": "no pending OTP"})
+                otp = str(payload.get("otp") or "").strip()
+                body = {"otp": otp, "email": state["email"], "e": True,
+                        "channels": ["sms" if state["is_mobile"] else "email"],
+                        "verify_via": ["mobile" if state["is_mobile"]
+                                       else "email"],
+                        "with_access_token": True}
+                if state["is_mobile"]:
+                    body = {"otp": otp, "email": state["email"],
+                            "grant_type": "otp",
+                            "verify_via": ["mobile"]}
+                ok, resp = api_post(
+                    "/api/micro/oauth/v2/login/otp/verify", body, auth=False)
+                if not ok:
+                    return self._send_json(
+                        {"ok": False, "message": "wrong/expired OTP"})
+                enc = resp.get("encData") if isinstance(resp, dict) else None
+                if not enc:
+                    return self._send_json(
+                        {"ok": False, "message": "unexpected response"})
+                sess = decrypt_encdata(enc)
+                if not sess or not sess.get("access_token"):
+                    return self._send_json(
+                        {"ok": False, "message": "decrypt failed"})
+                save_auth({
+                    "access_token": sess.get("access_token"),
+                    "refresh_token": sess.get("refresh_token"),
+                    "expires_in": sess.get("expires_in"),
+                    "token_type": sess.get("token_type", "Bearer"),
+                    "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+                    "user": {k: sess.get(k) for k in
+                             ("id", "name", "email", "mobile")},
+                })
+                who = sess.get("name") or sess.get("email") or "user"
+                print(f"\n✓ logged-in via browser as {who} "
+                      f"(session saved)", flush=True)
+                return self._send_json(
+                    {"ok": True,
+                     "message": f"Logged in as {who}. You can close this tab."})
+            return self._send(404, "not found")
+
+        def _send_json(self, obj):
+            self._send(200, json.dumps(obj), "application/json")
+
+        def log_message(self, *a):      # quiet
+            pass
+
+    port = args.port
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    ip = args.public_ip or _public_ip()
+    url = f"http://{ip}:{port}/"
+    print(c("── unstop login bridge ──", BOLD))
+    print(c(f"open in any browser:  ", DIM) + c(url, BOLD, CYAN))
+    print(c("(owner fills email/mobile + OTP there; session is saved here "
+            "server-side — token never touches the browser)", DIM))
+    print(c("ctrl-c to stop once logged in", DIM))
+    try:
+        srv.serve_forever()             # exactly one loop (hang pitfall)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    sess = load_auth()
+    if sess.get("access_token"):
+        u = sess.get("user") or {}
+        print(c(f"✓ Logged in as {u.get('name') or u.get('email')}", GREEN))
+
+
+def cmd_login_qr(args):
+    """Terminal QR of the expose URL (for phone cameras / agent screenshots).
+
+    Renders a scannable QR using pure-python encoding (byte mode, ECC L)
+    without external deps."""
+    import subprocess as sp
+    port = args.port
+    ip = args.public_ip or _public_ip()
+    url = f"http://{ip}:{port}/"
+    have_qrencode = shutil.which("qrencode")
+    if have_qrencode:
+        sp.run([have_qrencode, "-t", "ansiutf8", url])
+    else:
+        die("qrencode not installed — apt install qrencode, or just use "
+            "`unstop login --expose` which prints the URL")
+
+
+# ------------------------------------------------------- account commands
+def cmd_me(args):
+    """Everything a normal person sees about their own activity."""
+    p = _profile_decrypted()
+    if not isinstance(p, dict) or not p:
+        die("not logged in — run `unstop login`")
+    if args.json:
+        print(json.dumps(p, indent=2, ensure_ascii=False))
+        return
+    interesting = ("id", "username", "email", "mobile", "name",
+                   "user_category", "profile_percentage", "coins",
+                   "isProMember", "city", "country",
+                   "course_programme", "course_pursuing",
+                   "course_specialization", "career_goal")
+    rows = [(k, p.get(k)) for k in interesting
+            if p.get(k) not in (None, "", [], {})]
+    if not rows:
+        rows = [(k, v) for k, v in sorted(p.items())
+                if v not in (None, "", [], {})][:15]
+    w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"{c((k + ':').ljust(w + 1), CYAN)} {v}")
+
+
+def _authed_list(path, params=None):
+    payload = api_get(path, params or {}, quiet=True)
+    d = payload.get("data") if isinstance(payload, dict) else None
+    items = d.get("data") if isinstance(d, dict) else d
+    if items:
+        return items
+    # some endpoints are POST-only
+    ok, resp = api_post(path, params or {}, quiet=True)
+    d = resp.get("data") if isinstance(resp, dict) else None
+    items = (d.get("data") if isinstance(d, dict) else d)
+    return items or []
+
+
+def cmd_registrations(args):
+    """Opportunities I am registered in."""
+    items = _authed_list("/api/user/get-registered-user")
+    if args.json:
+        print(json.dumps(items, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        print(c("No registrations found.", YELLOW))
+        return
+    print(c(f"── my registrations · {len(items)} ──", BOLD))
+    print()
+    for i, r in enumerate(items[:args.limit], 1):
+        opp = r.get("opportunity") or r
+        title = opp.get("title") or r.get("title") or "?"
+        org = ((opp.get("organisation") or {}).get("name")
+               if isinstance(opp.get("organisation"), dict) else "") \
+              or r.get("organisation_name") or ""
+        status = r.get("moderation_status") or r.get("status") or ""
+        line = f"{c(str(i).rjust(3), DIM)} {c(title[:70], BOLD)}"
+        if org:
+            line += f"\n     {c(org, CYAN)}"
+        if status:
+            line += c(f" · {status}", DIM)
+        oid = opp.get("id") or r.get("opportunity_id") or ""
+        if oid:
+            line += f"   #{oid}"
+        print(line)
+
+
+def cmd_my_competitions(args):
+    items = _authed_list("/api/my-competitions",
+                         {"page": args.page,
+                          "per_page": max(args.limit, 10)})
+    if args.json:
+        print(json.dumps(items, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        print(c("No competitions found.", YELLOW))
+        return
+    print(c(f"── my competitions · page {args.page} ──", BOLD))
+    print()
+    for i, r in enumerate(items[:args.limit], 1):
+        title = r.get("title") or (r.get("opportunity") or {}).get("title") or "?"
+        phase = r.get("phase_name") or r.get("round_name") or ""
+        status = r.get("moderation_status") or ""
+        print(f"{c(str(i).rjust(3), DIM)} {c(title[:70], BOLD)}"
+              + (f"\n     {c(phase + ' · ' + status, CYAN)}" if phase or status else ""))
+
+
+def cmd_certificates(args):
+    items = _authed_list("/api/user/certificates")
+    if args.json:
+        print(json.dumps(items, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        print(c("No certificates yet.", YELLOW))
+        return
+    print(c(f"── certificates · {len(items)} ──", BOLD))
+    print()
+    for i, ct in enumerate(items[:args.limit], 1):
+        title = ct.get("title") or ct.get("opportunity_title") or "?"
+        url = ct.get("certificate_url") or ct.get("url") or ""
+        date = str(ct.get("created_at") or ct.get("issued_at") or "")[:10]
+        print(f"{c(str(i).rjust(3), DIM)} {c(title[:60], BOLD)}"
+              + (c(f"  {date}", DIM) if date else "")
+              + (f"\n     {url}" if url else ""))
+
+
+# ------------------------------------------------------- registration
+def cmd_register(args):
+    """Register the logged-in user into an opportunity (individual team)."""
+    sess = load_auth()
+    if not sess.get("access_token"):
+        die("not logged in — run `unstop login`")
+    ident = require_id(args.id)
+    opp = fetch_opp(ident)
+    title = (opp or {}).get("title") or f"#{ident}"
+    if args.json and not args.yes:
+        pass  # proceed silently in json mode
+    # pre-check eligibility when the endpoint answers
+    elig = api_get(f"/api/registration/can-player-register/{ident}",
+                   quiet=True)
+    if isinstance(elig, dict) and elig.get("status") is False:
+        die(f"not eligible: {elig.get('message') or 'unknown reason'}")
+
+    profile = _profile_decrypted() or {}
+    name = args.name or profile.get("name") or \
+        ((sess.get("user") or {}).get("name")) or input("Your full name: ").strip()
+    email = profile.get("email") or (sess.get("user") or {}).get("email")
+    if not email:
+        die("could not determine your email from the session")
+    gender = (args.gender or "").upper()
+    if gender not in ("F", "M", "T", "I", "NB", "O"):
+        try:
+            gender = input("Gender (F/M/T/I/NB/O): ").strip().upper()
+        except EOFError:
+            gender = ""
+    if gender not in ("F", "M", "T", "I", "NB", "O"):
+        die("gender required: one of F/M/T/I/NB/O")
+
+    body = {
+        "team": {
+            "name": str(name),
+            "subscription": 1,
+            "players": [{"player_type": 1, "email": email,
+                         "name": str(name), "gender": gender}],
+        },
+        "source_url": public_url(opp) or f"{BASE}/competitions/x/register",
+        "client_id": None,
+        "time_zone": "Asia/Kolkata",
+    }
+    if not args.yes and not args.json:
+        ans = input(c(f"Register into “{title}” as {name} ({gender})? [y/N] ",
+                      YELLOW)).strip().lower()
+        if ans != "y":
+            print("aborted.")
+            return
+    ok, resp = api_post(
+        f"/api/registration/team/{ident}/create", body)
+    if args.json:
+        print(json.dumps(resp, indent=2, ensure_ascii=False))
+    if ok and isinstance(resp, dict) and resp.get("status") is not False:
+        team = (resp.get("data") or {}).get("oRegisteredTeam") or {}
+        tid = team.get("id") or ""
+        msg = resp.get("message") or "registered successfully"
+        if not args.json:
+            print(c(f"✓ {msg} · {title}", GREEN)
+                  + (c(f"  (team #{tid})", DIM) if tid else ""))
+            url = public_url(opp)
+            if url:
+                print(c(url, DIM))
+    else:
+        msg = resp.get("message") if isinstance(resp, dict) else str(resp)[:200]
+        if msg and "verify your mobile" in str(msg).lower():
+            print(c("Unstop requires a verified mobile number for this event.", YELLOW))
+            print(c("Add + verify one on unstop.com (Settings → Mobile), or:", DIM))
+            print(c(f"  unstop mobile add +91XXXXXXXXXX", DIM))
+            print(c("then retry: unstop register " + ident, DIM))
+        die(f"registration failed: {msg}")
+
+
+def _mobile_dispatch(args):
+    if args.mobile:
+        cmd_mobile_add(args)
+    else:
+        die("usage: unstop mobile add +91XXXXXXXXXX [--otp NNNNNN]")
+
+
+def cmd_mobile_add(args):
+    """Submit a mobile number and verify it via OTP (email-style flow)."""
+    sess = load_auth()
+    uid = (sess.get("user") or {}).get("id") or ""
+    if not sess.get("access_token"):
+        die("not logged in")
+    raw = args.mobile.lstrip("+").replace(" ", "")
+    if not re.fullmatch(r"\d{10,13}", raw):
+        die("pass digits only, e.g. 919876543210 or 9876543210")
+    ok, resp = api_post("/api/update/user/mobile",
+                        {"user_id": int(uid) if uid.isdigit() else uid,
+                         "mobile": "+" + raw})
+    if not ok or not (isinstance(resp, dict) and resp.get("status", True)):
+        die(f"mobile submit failed: {resp}")
+    print(c("✚ OTP sent to +" + raw, GREEN))
+    try:
+        otp = args.otp or getpass.getpass("Enter OTP: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        die("no OTP entered — rerun with --otp")
+    email_like = raw + "@mobileairtel.com" if raw.startswith("91") \
+        else "91" + raw[-10:] + "@mobileairtel.com"
+    ok2, resp2 = api_post(
+        "/api/micro/oauth/v2/login/otp/verify",
+        {"otp": otp.strip(), "email": email_like,
+         "grant_type": "otp", "verify_via": ["mobile"]})
+    if ok2:
+        # refresh the saved session tokens if a new encData came back
+        enc = resp2.get("encData") if isinstance(resp2, dict) else None
+        if enc:
+            fresh = decrypt_encdata(enc)
+            if fresh and fresh.get("access_token"):
+                save = load_auth()
+                save["access_token"] = fresh["access_token"]
+                save["refresh_token"] = fresh.get("refresh_token")
+                save_auth(save)
+        print(c("✓ mobile verified", GREEN))
+    else:
+        die(f"verification failed: {resp2}")
+
+
+# ---------------------------------------------------------------- cli
+def main():
+    ap = argparse.ArgumentParser(
+        prog="unstop", description="Browse Unstop.com from the terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+          examples:
+            unstop hackathons                 live hackathons
+            unstop hackathons -k ai           keyword filter (server-side)
+            unstop closing -d 7               all types closing within 7 days
+            unstop competitions -n 15 -p 2    paginate
+            unstop search "ai hackathon"      global search
+            unstop detail 1742795             one event's info
+            unstop stats 1736086              top colleges in an event
+            unstop watch add 1742795          track it locally
+            unstop login                      OTP login (email or mobile)
+            unstop whoami                     account details
+            unstop --json internships         machine-readable output"""))
+    ap.add_argument("--json", action="store_true", help="raw JSON output")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p):
+        p.add_argument("-p", "--page", type=int, default=1)
+        p.add_argument("-n", "--limit", type=int, default=10)
+        p.add_argument("-k", "--keyword", help="server-side title filter")
+        p.add_argument("--sort", choices=SORTS, default="latest")
+        p.add_argument("--status", choices=STATUSES, default="live")
+
+    for name in sorted(TYPES):
+        sp = sub.add_parser(name, help=f"list live {plural(name)}")
+        common(sp)
+        sp.set_defaults(fn=cmd_list, type=name)
+        for alias in TYPES[name]:
+            if alias == name:
+                continue
+            sa = sub.add_parser(alias, help=f"alias for '{name}'")
+            common(sa)
+            sa.set_defaults(fn=cmd_list, type=name)
+
+    sp = sub.add_parser("closing", help="events closing within N days")
+    sp.add_argument("-d", "--days", type=int, default=7)
+    sp.add_argument("--pages", type=int, default=3,
+                    help="pages scanned per type (default 3)")
+    sp.set_defaults(fn=cmd_closing)
+
+    sp = sub.add_parser("search", help="global search")
+    sp.add_argument("query", nargs="+")
+    sp.add_argument("-n", "--limit", type=int, default=10)
+    sp.set_defaults(fn=cmd_search)
+
+    sp = sub.add_parser("detail", help="details for an id")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_detail)
+
+    sp = sub.add_parser("stats", help="top colleges for an event")
+    sp.add_argument("id")
+    sp.add_argument("--top", type=int, default=10)
+    sp.set_defaults(fn=cmd_stats)
+
+    sp = sub.add_parser("orgs", help="browse organisations")
+    common(sp)
+    sp.add_argument("--home", action="store_true", help="featured orgs only")
+    sp.set_defaults(fn=cmd_orgs)
+
+    sp = sub.add_parser("platform", help="platform-wide stats")
+    sp.set_defaults(fn=cmd_platform)
+
+    sp = sub.add_parser("open", help="print/open event URL")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_open)
+
+    sp = sub.add_parser("types", help="supported types")
+    sp.set_defaults(fn=cmd_types)
+
+    # ---- v3: public content APIs --------------------------------------
+    sp = sub.add_parser("blogs", help="browse Unstop blog posts")
+    sp.add_argument("query", nargs="*", help="keyword filter (title/excerpt)")
+    common(sp)
+    sp.add_argument("--pages", type=int, default=3,
+                    help="pages scanned (default 3)")
+    sp.add_argument("--category", type=int, action="append",
+                    help="category id from `unstop cats` (repeatable)")
+    sp.set_defaults(fn=cmd_blogs)
+
+    sp = sub.add_parser("blog", help="read one post by slug or id")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_blog)
+
+    sp = sub.add_parser("cats", help="blog categories")
+    sp.set_defaults(fn=cmd_cats)
+
+    sp = sub.add_parser("tags", help="platform tags")
+    common(sp)
+    sp.set_defaults(fn=cmd_tags)
+
+    sp = sub.add_parser("watch", help="local watchlist (add/rm/list)")
+    sp.add_argument("action", choices=["add", "rm", "list"], nargs="?",
+                    default="list")
+    sp.add_argument("id", nargs="?")
+    sp.set_defaults(fn=cmd_watch)
+
+    # ---- auth ----------------------------------------------------------
+    sp = sub.add_parser(
+        "login", help="login via OTP (email or mobile)")
+    sp.add_argument("email", nargs="?", help="email or 10-digit mobile")
+    sp.add_argument("--otp", help="OTP code (skip the prompt)")
+    sp.add_argument("--expose", action="store_true",
+                    help="headless/agent mode: serve a browser login page "
+                         "on 0.0.0.0:PORT so the owner can complete login "
+                         "from any device; session saved server-side")
+    sp.add_argument("--port", type=int, default=8777,
+                    help="port for --expose (default 8777)")
+    sp.add_argument("--public-ip", default=None,
+                    help="public hostname/IP to advertise with --expose "
+                         "(auto-detected if omitted)")
+    sp.set_defaults(fn=_login_dispatch)
+
+    sp = sub.add_parser(
+        "login-qr", help="print a scannable QR of the --expose login URL")
+    sp.add_argument("--port", type=int, default=8777)
+    sp.add_argument("--public-ip", default=None)
+    sp.set_defaults(fn=cmd_login_qr)
+
+    sp = sub.add_parser(
+        "login-token",
+        help="paste an existing access token instead of OTP")
+    sp.add_argument("token", nargs="?", help="access token (prompted if omitted)")
+    sp.set_defaults(fn=cmd_login_token)
+
+    sp = sub.add_parser(
+        "login-password",
+        help="classic email + password login (for accounts that have one)")
+    sp.add_argument("email", nargs="?", help="account email")
+    sp.add_argument("-p", "--password", help="password (prompted if omitted)")
+    sp.set_defaults(fn=cmd_login_password)
+
+    sp = sub.add_parser(
+        "login-refresh",
+        help="exchange a refresh_token for a fresh session")
+    sp.add_argument("refresh_token", nargs="?",
+                    help="(default: the saved refresh token)")
+    sp.set_defaults(fn=cmd_login_refresh)
+
+    sp = sub.add_parser(
+        "login-social",
+        help="Google / Facebook / LinkedIn login bridge (paste provider "
+             "token or LinkedIn code in a browser page)")
+    sp.add_argument("--port", type=int, default=8778)
+    sp.add_argument("--public-ip", default=None)
+    sp.set_defaults(fn=cmd_login_social)
+
+    sp = sub.add_parser("whoami", help="show logged-in account details")
+    sp.set_defaults(fn=cmd_whoami)
+
+    sp = sub.add_parser("logout", help="clear saved session")
+    sp.set_defaults(fn=cmd_logout)
+
+    sp = sub.add_parser("status", help="is the session alive?")
+    sp.set_defaults(fn=cmd_status)
+
+    # ---- account (authed) ----------------------------------------------
+    sp = sub.add_parser("me", help="your profile summary")
+    sp.set_defaults(fn=cmd_me)
+
+    sp = sub.add_parser("registrations", help="opportunities you registered in")
+    sp.add_argument("-n", "--limit", type=int, default=15)
+    sp.set_defaults(fn=cmd_registrations)
+
+    sp = sub.add_parser("my-competitions", help="competitions dashboard data")
+    common(sp)
+    sp.set_defaults(fn=cmd_my_competitions)
+
+    sp = sub.add_parser("certificates", help="your certificates + links")
+    sp.add_argument("-n", "--limit", type=int, default=15)
+    sp.set_defaults(fn=cmd_certificates)
+
+    sp = sub.add_parser("register",
+                        help="register yourself into an opportunity")
+    sp.add_argument("id", help="opportunity id (from `unstop hackathons` etc.)")
+    sp.add_argument("-g", "--gender", help="F / M / T / I / NB / O")
+    sp.add_argument("--name", help="override the name used for registration")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="skip confirmation prompt")
+    sp.set_defaults(fn=cmd_register)
+
+    sp = sub.add_parser("mobile",
+                        help="mobile verification (add/rm/list)")
+    sp.add_argument("action", choices=["add"], nargs="?", default="add")
+    sp.add_argument("mobile", nargs="?", help="+91XXXXXXXXXX")
+    sp.add_argument("--otp", help="OTP code (skip prompt)")
+    sp.set_defaults(fn=_mobile_dispatch)
+
+    args = ap.parse_args()
+    fn = getattr(args, "fn", None)
+    if not fn:
+        ap.print_help()
+        return
+    # attach global --json onto subcommands
+    if not hasattr(args, "json"):
+        args.json = False
+    fn(args)
+
+
+if __name__ == "__main__":
+    main()
